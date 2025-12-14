@@ -1,0 +1,209 @@
+services:
+  # --- Portainer ---
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: always
+    ports:
+      - "8000:8000"
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # --- MongoDB ---
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    restart: no
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+    ports:
+      - "${MONGO_PORT}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh -u $MONGO_USERNAME -p $MONGO_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ ping: 1 })' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis ---
+  redis:
+    image: redis:8.2
+    container_name: redis
+    restart: no
+    command: [ "redis-server", "--requirepass", "${REDIS_PASSWORD}" ]
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- MySQL ---
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: no
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "${MYSQL_PORT}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- phpMyAdmin for MySQL UI ---
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: phpmyadmin
+    restart: no
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: ${MYSQL_USER}
+      PMA_PASSWORD: ${MYSQL_PASSWORD}
+      UPLOAD_LIMIT: 100M
+    ports:
+      - "${PHPMYADMIN_PORT}:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # --- RabbitMQ ---
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: no
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "${RABBITMQ_PORT}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Elasticsearch ---
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: elasticsearch
+    restart: no
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      xpack.security.enabled: "true"
+      ELASTIC_PASSWORD: ${ELASTIC_SUPERUSER_PASSWORD}
+    ports:
+      - "${ELASTICSEARCH_PORT}:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_SUPERUSER_PASSWORD} http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # --- Elasticsearch initialization ---
+  elastic-init:
+    image: curlimages/curl:8.10.1
+    container_name: elastic-init
+    restart: "no"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      echo "⏳ Waiting for Elasticsearch to be ready...";
+      until curl -s -u elastic:${ELASTIC_SUPERUSER_PASSWORD} http://elasticsearch:9200 >/dev/null 2>&1; do
+        sleep 5;
+      done;
+
+      echo "✅ Elasticsearch ready. Setting passwords and users...";
+
+      # Set kibana_system password
+      curl -s -X POST "http://elasticsearch:9200/_security/user/kibana_system/_password" \
+        -u elastic:${ELASTIC_SUPERUSER_PASSWORD} \
+        -H "Content-Type: application/json" \
+        -d "{\"password\": \"${KIBANA_PASSWORD}\"}";
+      echo "✅ kibana_system password set.";
+
+      # Create esAdmin role (cluster + index full access)
+      curl -s -X POST "http://elasticsearch:9200/_security/role/esAdmin" \
+        -u elastic:${ELASTIC_SUPERUSER_PASSWORD} \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"cluster\": [\"all\"],
+          \"indices\": [
+            { \"names\": [\"*\"], \"privileges\": [\"all\"] }
+          ]
+        }";
+      echo "✅ esAdmin role ensured.";
+
+      # Create esAdmin user if missing
+      if ! curl -s -u elastic:${ELASTIC_SUPERUSER_PASSWORD} http://elasticsearch:9200/_security/user/${ELASTIC_APP_USER_USERNAME} | grep -q "${ELASTIC_APP_USER_USERNAME}"; then
+        curl -s -X POST "http://elasticsearch:9200/_security/user/${ELASTIC_APP_USER_USERNAME}" \
+          -u elastic:${ELASTIC_SUPERUSER_PASSWORD} \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"password\": \"${ELASTIC_APP_USER_PASSWORD}\",
+            \"roles\": [\"esAdmin\"],
+            \"full_name\": \"Application User\",
+            \"email\": \"app@example.com\"
+          }";
+        echo "✅ esAdmin user created.";
+      else
+        echo "ℹ️ esAdmin user already exists. Skipping.";
+      fi
+
+  # --- Kibana ---
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: kibana
+    restart: on-failure
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: ${KIBANA_USERNAME}
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD}
+    ports:
+      - "${KIBANA_PORT}:5601"
+    depends_on:
+      elastic-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+# --- Volumes ---
+volumes:
+  mongo_data:
+  redis_data:
+  mysql_data:
+  rabbitmq_data:
+  elasticsearch_data:
+  portainer_data:
